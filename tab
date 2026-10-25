@@ -165,7 +165,8 @@ cmd_watch() {
 
 cmd_apk() {
   local apk
-  apk=$(phone "cd ~/$TAB_PHONE_DIR && shopt -s globstar nullglob && ls -t $TAB_APK_GLOB 2>/dev/null | head -1")
+  # An empty match must not fall through to a bare `ls -t` (that lists the repo root).
+  apk=$(phone "cd ~/$TAB_PHONE_DIR && shopt -s globstar nullglob && m=($TAB_APK_GLOB) && [ \${#m[@]} -gt 0 ] && ls -t \"\${m[@]}\" | head -1")
   [ -n "$apk" ] || die "no APK matching $TAB_APK_GLOB"
   phone "cat ~/$TAB_PHONE_DIR/$apk" > "$(basename "$apk")"
   echo "$(basename "$apk")  ($apk on the phone)"
