@@ -156,6 +156,21 @@ TAB_BUILD_CMD='node ../../node_modules/@polygon-mv/rn-build-cache/bin/rn-build-c
 TAB_APK_GLOB='android/app/build/outputs/rn-build-cache/*.apk'
 ```
 
+## Numbers
+
+Galaxy S23 Ultra (8 cores, 12 GB), an Expo SDK 58 / React Native 0.88 dev client
+(`assembleDebugOptimized`, arm64-v8a, ~20 native modules) built through rn-build-cache, 6 Gradle
+workers, downloaded dependencies kept:
+
+| build                                            | wall clock |
+| ------------------------------------------------ | ---------- |
+| fresh (build outputs, build cache, ccache wiped)  | 15:13      |
+| no change (rn-build-cache local hit)             | 0:08       |
+| one Kotlin file changed                          | 3:59       |
+
+The phone peaked at 90 °C and throttled its fastest core to about half its clock during the fresh
+build; the lowest free RAM was about 1 GB of 11 GB, with other apps running.
+
 ## Caveats
 
 - The phone gets hot; it throttles itself and the build slows down. Keep it on a charger and out
