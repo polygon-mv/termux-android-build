@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# tab: build Android (Gradle) projects ON an Android phone in Termux, driven from a computer over USB.
+#
+#   tab setup            install Termux + sshd + JDK/SDK/NDK on the phone (once; re-runnable)
+#   tab sshd             (re)start the phone's sshd outside the Termux app, forward the port
+#   tab sync [rev]       copy a git rev of TAB_REPO to the phone, commit it locally, run TAB_POST_SYNC
+#   tab build            run TAB_BUILD_CMD on the phone in the background (log: ~/.tab/build.log)
+#   tab watch            follow the build: task count, failures, low memory, exit
+#   tab log [n]          last n lines of the build log
+#   tab apk              copy the newest APK under TAB_APK_GLOB to the computer
+#   tab ssh [cmd...]     shell (or command) on the phone, with the build env loaded
+#
+# Config: environment variables, or a file named by TAB_CONFIG (default ./.tab.env). See README.md.
+set -euo pipefail
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+TAB_CONFIG=${TAB_CONFIG:-./.tab.env}
+# shellcheck disable=SC1090
+[ -f "$TAB_CONFIG" ] && source "$TAB_CONFIG"
+
+: "${TAB_SERIAL:=}"
+: "${TAB_PORT:=8022}"
+: "${TAB_KEY:=$HOME/.ssh/termux_build}"
+: "${TAB_TERMUX_VERSION:=v0.118.3}"
+: "${TAB_JDKS:=17 21}"
+: "${TAB_JAVA_HOME_VERSION:=21}"
+: "${TAB_SDK_PACKAGES:=platforms;android-36 build-tools;36.0.0}"
+: "${TAB_NDK_VERSION:=}"        # e.g. 27.1.12297006 (what the project's ndkVersion asks for)
+: "${TAB_NDK_RELEASE:=}"        # e.g. r27b (HomuHomu833/android-ndk-custom release matching it)
+: "${TAB_PKGS:=}"               # extra Termux packages, e.g. "nodejs-lts"
+: "${TAB_BUN_VERSION:=}"        # e.g. 1.4.3: installs bun, run as `grun ~/.tab/bun/bun`
+: "${TAB_GRADLE_HEAP:=3g}"
+: "${TAB_GRADLE_WORKERS:=}"     # default: all cores
+: "${TAB_GRADLE_PROPS:=}"       # extra lines for the phone's ~/.gradle/gradle.properties
+: "${TAB_REPO:=$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
+: "${TAB_NAME:=$(basename "$TAB_REPO")}"
+: "${TAB_PHONE_DIR:=src/$TAB_NAME}"   # relative to the Termux home
+: "${TAB_POST_SYNC:=}"          # phone-side shell, run in TAB_PHONE_DIR after each sync
+: "${TAB_BUILD_DIR:=.}"         # relative to TAB_PHONE_DIR
+: "${TAB_BUILD_CMD:=./gradlew assembleDebug}"
+: "${TAB_APK_GLOB:=**/build/outputs/**/*.apk}"
+
+ADB=(adb)
+[ -n "$TAB_SERIAL" ] && ADB=(adb -s "$TAB_SERIAL")
+SSH=(ssh -p "$TAB_PORT" -i "$TAB_KEY" -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30
+     -o ConnectTimeout=10 -o LogLevel=ERROR localhost)
+T=/data/data/com.termux/files
+
+die() { echo "tab: $*" >&2; exit 1; }
+phone() { "${SSH[@]}" "$@"; }
+# Run on the phone with the build env (written by setup) loaded.
+phone_env() { "${SSH[@]}" "source ~/.tab/env 2>/dev/null; $*"; }
+
+# A bash -lc inside Termux, but started by `run-as` (needs the debuggable GitHub build of Termux).
+# Its processes are children of adbd, not of the Termux app.
+runas() {
+  "${ADB[@]}" shell "run-as com.termux $T/usr/bin/env -i HOME=$T/home PREFIX=$T/usr PATH=$T/usr/bin \
+    TMPDIR=$T/usr/tmp LANG=en_US.UTF-8 LD_PRELOAD=$T/usr/lib/libtermux-exec.so \
+    $T/usr/bin/bash -lc '$1'"
+}
+
+cmd_sshd() {
+  # Android's phantom process killer caps an app's descendants at 32 and kills ALL of them past
+  # that ("Trimming phantom processes"). A Gradle build with ninja + clang passes 32 in seconds.
+  # An sshd started through run-as is not the app's descendant, so neither it nor anything run
+  # over ssh is counted; it also runs in the root cpuset (all cores), even with Termux backgrounded.
+  runas 'pgrep -x sshd >/dev/null || sshd'
+  "${ADB[@]}" forward "tcp:$TAB_PORT" tcp:8022 >/dev/null
+  phone 'echo "sshd up ($(cat /proc/self/attr/current | cut -d: -f3)), $(nproc) cores"'
+}
+
+cmd_setup() {
+  local work; work=$(mktemp -d)
+  if ! "${ADB[@]}" shell pm list packages | grep -q '^package:com.termux$'; then
+    local base="https://github.com/termux/termux-app/releases/download/$TAB_TERMUX_VERSION"
+    local apk="termux-app_${TAB_TERMUX_VERSION}%2Bgithub-debug_arm64-v8a.apk"
+    echo "installing Termux $TAB_TERMUX_VERSION (GitHub debug build: run-as works on it)"
+    curl -fsSL -o "$work/termux.apk" "$base/$apk"
+    local want; want=$(curl -fsSL "$base/termux-app_${TAB_TERMUX_VERSION}%2Bgithub-debug_sha256sums" | awk '/arm64/{print $1}')
+    [ "$(shasum -a 256 "$work/termux.apk" | cut -d' ' -f1)" = "$want" ] || die "Termux APK sha256 mismatch"
+    "${ADB[@]}" install "$work/termux.apk"
+    "${ADB[@]}" shell am start -n com.termux/.app.TermuxActivity >/dev/null
+    echo "waiting for Termux's first-run bootstrap"
+    for _ in $(seq 60); do runas 'test -x $PREFIX/bin/apt' >/dev/null 2>&1 && break; sleep 2; done
+  fi
+
+  [ -f "$TAB_KEY" ] || ssh-keygen -q -t ed25519 -N "" -f "$TAB_KEY" -C termux-android-build
+  "${ADB[@]}" push "$TAB_KEY.pub" /data/local/tmp/tab_key.pub >/dev/null
+  "${ADB[@]}" shell chmod 644 /data/local/tmp/tab_key.pub
+  # Typing into the Termux window via `adb shell input` garbles text, so everything goes via run-as.
+  runas 'apt-get update -q && apt-get -yq -o Dpkg::Options::=--force-confnew upgrade &&
+    apt-get install -yq -o Dpkg::Options::=--force-confnew openssh &&
+    mkdir -p ~/.ssh && cat /data/local/tmp/tab_key.pub >> ~/.ssh/authorized_keys &&
+    sort -u -o ~/.ssh/authorized_keys ~/.ssh/authorized_keys &&
+    chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys'
+  "${ADB[@]}" shell rm -f /data/local/tmp/tab_key.pub
+  cmd_sshd
+
+  phone "TAB_JDKS='$TAB_JDKS' TAB_JAVA_HOME_VERSION='$TAB_JAVA_HOME_VERSION' \
+    TAB_SDK_PACKAGES='$TAB_SDK_PACKAGES' TAB_NDK_VERSION='$TAB_NDK_VERSION' \
+    TAB_NDK_RELEASE='$TAB_NDK_RELEASE' TAB_PKGS='$TAB_PKGS' TAB_BUN_VERSION='$TAB_BUN_VERSION' \
+    TAB_GRADLE_HEAP='$TAB_GRADLE_HEAP' TAB_GRADLE_WORKERS='$TAB_GRADLE_WORKERS' \
+    TAB_GRADLE_PROPS='$TAB_GRADLE_PROPS' bash -s" < "$HERE/phone/setup.sh"
+  rm -rf "$work"
+}
+
+cmd_sync() {
+  local rev=${1:-HEAD} sha
+  git -C "$TAB_REPO" rev-parse --verify -q "$rev^{commit}" >/dev/null || die "unknown rev $rev"
+  sha=$(git -C "$TAB_REPO" rev-parse --short "$rev")
+  echo "syncing $TAB_NAME $rev ($sha) to ~/$TAB_PHONE_DIR"
+  git -C "$TAB_REPO" archive --format=tar "$sha" |
+    phone "rm -rf ~/.tab/incoming && mkdir -p ~/.tab/incoming && tar -x -C ~/.tab/incoming"
+  phone_env "TAB_PHONE_DIR='$TAB_PHONE_DIR' SHA='$sha' bash -s" <<'PHONE'
+set -euo pipefail
+dir=~/$TAB_PHONE_DIR
+mkdir -p "$dir"
+# Mirror the tree; keep dependencies and build outputs so the next build is incremental.
+# P = protect: never deleted on the phone, but tracked files of the same name still sync.
+rsync -a --delete --filter='P .git/' --filter='P node_modules/' --filter='P .gradle/' \
+  --filter='P .cxx/' --filter='P build/' --filter='P local.properties' ~/.tab/incoming/ "$dir/"
+rm -rf ~/.tab/incoming
+cd "$dir"
+# A local-only repo, one commit per synced rev: tools that fingerprint the committed tree or
+# restore generated files with git (rn-build-cache does both) work. Never pushed anywhere.
+[ -d .git ] || git init -q
+git add -A && git -c user.name=tab -c user.email=tab@localhost commit -qm "sync $SHA" --allow-empty
+echo "$SHA" > ~/.tab/rev
+PHONE
+  if [ -n "$TAB_POST_SYNC" ]; then
+    echo "post-sync: $TAB_POST_SYNC"
+    phone_env "cd ~/$TAB_PHONE_DIR && $TAB_POST_SYNC"
+  fi
+}
+
+cmd_build() {
+  phone_env "cd ~/$TAB_PHONE_DIR/$TAB_BUILD_DIR && pgrep -f '^bash -c # tab-build' >/dev/null && { echo 'a build is already running'; exit 1; }
+    find . -path ./node_modules -prune -o -name gradlew -print | while read -r g; do
+      printf 'sdk.dir=%s\ncmake.dir=%s\n' \"\$ANDROID_HOME\" \"\$PREFIX\" > \"\$(dirname \"\$g\")/local.properties\"; done
+    termux-wake-lock 2>/dev/null || true
+    nohup bash -c '# tab-build
+      start=\$(date +%s)
+      $TAB_BUILD_CMD > ~/.tab/build.log 2>&1
+      echo \"TAB_EXIT=\$? seconds=\$(( \$(date +%s) - start )) rev=\$(cat ~/.tab/rev 2>/dev/null)\" >> ~/.tab/build.log
+      termux-wake-unlock 2>/dev/null || true' >/dev/null 2>&1 &
+    echo \"build started (pid \$!): $TAB_BUILD_CMD\""
+}
+
+cmd_watch() {
+  # One line per 100 Gradle tasks, plus failures / low memory / the exit line. Exits with the build.
+  local last="" line key
+  while :; do
+    line=$(phone 'L=~/.tab/build.log; {
+      grep -aE "TAB_EXIT|What went wrong|BUILD SUCCESSFUL|BUILD FAILED|Trimming phantom" $L | tail -2
+      grep -aE "> Task .*buildCMake.* FAILED" $L | head -1
+      a=$(free -m | awk "/Mem:/{print \$7}"); [ "$a" -lt 800 ] && echo "LOW MEMORY: ${a} MB available"
+      echo "tasks=$(grep -ac "^> Task" $L) $(grep -a "^> Task" $L | tail -1 | cut -c8-90)"; } 2>/dev/null' ||
+      echo "ssh down (try: tab sshd)")
+    key=$(sed -E 's/tasks=([0-9]*)[0-9][0-9] .*/tasks=\1xx/; s/tasks=[0-9] .*/tasks=x/' <<<"$line")
+    [ "$key" != "$last" ] && { tr '\n' ' ' <<<"$line"; echo; last=$key; }
+    grep -q TAB_EXIT <<<"$line" && break
+    sleep 30
+  done
+}
+
+cmd_apk() {
+  local apk
+  apk=$(phone "cd ~/$TAB_PHONE_DIR && shopt -s globstar nullglob && ls -t $TAB_APK_GLOB 2>/dev/null | head -1")
+  [ -n "$apk" ] || die "no APK matching $TAB_APK_GLOB"
+  phone "cat ~/$TAB_PHONE_DIR/$apk" > "$(basename "$apk")"
+  echo "$(basename "$apk")  ($apk on the phone)"
+  shasum -a 256 "$(basename "$apk")"
+}
+
+case "${1:-}" in
+  setup) cmd_setup ;;
+  sshd) cmd_sshd ;;
+  sync) shift; cmd_sync "$@" ;;
+  build) cmd_build ;;
+  watch) cmd_watch ;;
+  log) phone "tail -n ${2:-40} ~/.tab/build.log" ;;
+  apk) cmd_apk ;;
+  ssh) shift; if [ $# -eq 0 ]; then "${SSH[@]/localhost/-t}" localhost; else phone_env "$*"; fi ;;
+  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac
